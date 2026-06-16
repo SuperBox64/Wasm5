@@ -101,7 +101,7 @@ final class ShellScene: SKScene {
         slot.lineWidth = 1
         slot.name = "slot"
         lines.addChild(slot)
-        let slotLabel = ShellFont.draw("WASMCART", lineWidth: 1 / 3.4)
+        let slotLabel = ShellFont.draw("WASMFIVE", lineWidth: 1 / 3.4)
         slotLabel.position = CGPoint(x: size.width / 2, y: slotY + 50)
         slotLabel.setScale(3.4)
         slotLabel.alpha = 0.625
