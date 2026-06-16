@@ -1,0 +1,5 @@
+Wasm5
+*.o
+*.standalone-bak
+carts/*.zip
+.DS_Store
