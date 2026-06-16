@@ -75,6 +75,18 @@ void wasm5_eject(void) {
     if (gServer)  { [gServer terminate]; gServer = nil; }
 }
 
+// Make the app a regular foreground app and the SDL window key, so it receives
+// keyboard events. Linking WebKit/Cocoa can leave the NSApplication un-activated
+// (window visible but not key), which swallows all keystrokes in the shell.
+void wasm5_activate(void *nswindow) {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp activateIgnoringOtherApps:YES];
+    if (nswindow) {
+        NSWindow *win = (__bridge NSWindow *)nswindow;
+        [win makeKeyAndOrderFront:nil];
+    }
+}
+
 // Service the main run loop so WebKit's networking/JS/rendering run while a cart is up.
 void wasm5_pump_runloop(double seconds) {
     [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode

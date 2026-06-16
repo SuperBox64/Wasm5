@@ -135,14 +135,12 @@ final class ShellScene: SKScene {
         y -= rowH * 0.4
         vectorText("OPEN FILE", at: CGPoint(x: size.width / 2, y: y), scale: 1.0, alpha: 0.65)
         dialogRect = CGRect(x: size.width / 2 - 240, y: y - rowH / 2, width: 480, height: rowH)
+        // No EMOJI mode toggle in Wasm5: carts play in a WKWebView and render emoji with
+        // the browser's system font, so the kit's apple/png/noto mode has no effect here.
+        emojiRect = .zero
 
-        y -= rowH
-        let mode = emojiModeNames[Int(emojiMode) % emojiModeNames.count]
-        vectorText("EMOJI: " + mode, at: CGPoint(x: size.width / 2, y: y), scale: 1.0, alpha: 0.65)
-        emojiRect = CGRect(x: size.width / 2 - 240, y: y - rowH / 2, width: 480, height: rowH)
-
-        vectorText("ARROWS SELECT  ENTER OR DOUBLE CLICK LOADS  DROP A WASM ANYTIME", at: CGPoint(x: size.width / 2, y: size.height * 0.10), scale: 0.9, alpha: 0.5)
-        vectorText("CLICK EMOJI TO SWITCH MODE   CTRL ESC EJECTS", at: CGPoint(x: size.width / 2, y: size.height * 0.06), scale: 0.9, alpha: 0.5)
+        vectorText("ARROWS SELECT  ENTER OR DOUBLE CLICK LOADS  DROP A CART ANYTIME", at: CGPoint(x: size.width / 2, y: size.height * 0.10), scale: 0.9, alpha: 0.5)
+        vectorText("CTRL ESC EJECTS BACK TO THE SHELL", at: CGPoint(x: size.width / 2, y: size.height * 0.06), scale: 0.9, alpha: 0.5)
     }
 
     private func loadSelected() {

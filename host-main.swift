@@ -13,6 +13,8 @@ import CSDL3
 func wasm5_play_cart(_ nswindow: UnsafeMutableRawPointer?, _ path: UnsafePointer<CChar>?)
 @_silgen_name("wasm5_eject")
 func wasm5_eject()
+@_silgen_name("wasm5_activate")
+func wasm5_activate(_ nswindow: UnsafeMutableRawPointer?)
 @_silgen_name("wasm5_pump_runloop")
 func wasm5_pump_runloop(_ seconds: Double)
 
@@ -84,6 +86,13 @@ enum Main {
         shell.scaleMode = .aspectFill
         view.presentScene(shell)
         shellView = view
+
+        // Foreground + key the SDL window so the shell actually receives keystrokes
+        // (the WebKit/Cocoa link can otherwise leave the app un-activated).
+        if let win = Kit.shared.window,
+           let raw = "SDL.window.cocoa.window".withCString({ SDL_GetPointerProperty(SDL_GetWindowProperties(win), $0, nil) }) {
+            wasm5_activate(raw)
+        }
 
         // game thread: tick + present the shell whenever no webview cart is up
         let gameThread = SDL_CreateThreadRuntime({ _ in
