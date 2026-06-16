@@ -45,10 +45,21 @@ func openCartDialog() {
     }, nil, Kit.shared.window, nil, 0, nil, false)
 }
 
-func showWebCart(_ path: String) {
-    guard SDL_GetAtomicInt(&cartLoaded) == 0, let win = Kit.shared.window else { return }
+// The native window handle SDL exposes, per platform: a pointer (macOS NSWindow,
+// Windows HWND) or a numeric X11 XID. The per-OS shim knows how to interpret it.
+func nativeWindowPtr() -> UnsafeMutableRawPointer? {
+    guard let win = Kit.shared.window else { return nil }
     let props = SDL_GetWindowProperties(win)
-    guard let raw = "SDL.window.cocoa.window".withCString({ SDL_GetPointerProperty(props, $0, nil) }) else { return }
+    for key in ["SDL.window.cocoa.window", "SDL.window.win32.hwnd"] {
+        if let raw = key.withCString({ SDL_GetPointerProperty(props, $0, nil) }) { return raw }
+    }
+    let xid = "SDL.window.x11.window".withCString { SDL_GetNumberProperty(props, $0, 0) }
+    if xid != 0 { return UnsafeMutableRawPointer(bitPattern: UInt(xid)) }
+    return nil
+}
+
+func showWebCart(_ path: String) {
+    guard SDL_GetAtomicInt(&cartLoaded) == 0, let raw = nativeWindowPtr() else { return }
     path.withCString { wasm5_play_cart(raw, $0) }
     SDL_SetAtomicInt(&cartLoaded, 1)
 }
@@ -89,10 +100,7 @@ enum Main {
 
         // Foreground + key the SDL window so the shell actually receives keystrokes
         // (the WebKit/Cocoa link can otherwise leave the app un-activated).
-        if let win = Kit.shared.window,
-           let raw = "SDL.window.cocoa.window".withCString({ SDL_GetPointerProperty(SDL_GetWindowProperties(win), $0, nil) }) {
-            wasm5_activate(raw)
-        }
+        if let raw = nativeWindowPtr() { wasm5_activate(raw) }
 
         // game thread: tick + present the shell whenever no webview cart is up
         let gameThread = SDL_CreateThreadRuntime({ _ in
