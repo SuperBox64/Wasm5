@@ -8,7 +8,89 @@
 
 static WKWebView *gWebView = nil;
 static NSTask    *gServer  = nil;
+static NSWindow  *gWindow  = nil;
+static id         gKeyMonitor = nil;
+static volatile int gEjectRequested = 0;
+static volatile int gQuitRequested  = 0;
 static const int  kPort    = 52900;
+
+extern void wasm5_push_key(int sfcode);   // host: push an SFML key code into the kit event queue
+
+// Polled by the host each frame. CTRL+ESC ejects; CMD+Q quits. (The monitor sees these
+// even when the webview owns the keyboard.)
+int wasm5_eject_requested(void) { int r = gEjectRequested; gEjectRequested = 0; return r; }
+int wasm5_quit_requested(void)  { return gQuitRequested; }
+
+// SDL3's macOS keyboard path is unreliable when WebKit is linked into the process (mouse
+// works, keys never reach SDL's content view). So we install ONE app-wide key monitor:
+//  - shell (no cart): translate nav keys to SFML codes and feed the kit directly;
+//  - cart (webview):  let keys flow to the webview, but grab CTRL+ESC / CMD+Q.
+// macOS virtual keyCode -> SFML code (for the SHELL, fed to the kit).
+static int macToSf(unsigned short kc) {
+    switch (kc) {
+        case 126: return 73; case 125: return 74; case 123: return 71; case 124: return 72;  // arrows
+        case 36: case 76: return 58;  // return/enter
+        case 49: return 57;           // space
+        case 14: return 4;            // E
+        default: return -1;
+    }
+}
+
+// macOS NSEvent -> DOM KeyboardEvent.code string (what runtime.js reads). nil = skip.
+static NSString *macToDomCode(NSEvent *e) {
+    switch (e.keyCode) {
+        case 123: return @"ArrowLeft";  case 124: return @"ArrowRight";
+        case 125: return @"ArrowDown";  case 126: return @"ArrowUp";
+        case 49:  return @"Space";      case 36:  return @"Enter";   case 76: return @"NumpadEnter";
+        case 53:  return @"Escape";     case 48:  return @"Tab";     case 51: return @"Backspace";
+        case 56: case 60: return @"ShiftLeft";
+        default: break;
+    }
+    NSString *ch = [e.charactersIgnoringModifiers lowercaseString];
+    if (ch.length == 1) {
+        unichar c = [ch characterAtIndex:0];
+        if (c >= 'a' && c <= 'z') return [NSString stringWithFormat:@"Key%C", (unichar)(c - 32)];
+        if (c >= '0' && c <= '9') return [NSString stringWithFormat:@"Digit%C", c];
+    }
+    return nil;
+}
+
+// Inject the keystroke straight into the webview's JS as a synthetic KeyboardEvent —
+// no first-responder/focus needed (runtime.js listens on window keydown/keyup, e.code).
+static void forwardKeyToWebview(NSEvent *e, BOOL down) {
+    if (!gWebView) return;
+    NSString *code = macToDomCode(e);
+    if (!code) { fprintf(stderr, "WASM5 FORWARD: no DOM code for keyCode=%d\n", e.keyCode); return; }
+    NSString *js = [NSString stringWithFormat:
+        @"(function(){var ev=new KeyboardEvent('%@',{code:'%@',key:'%@',bubbles:true,cancelable:true});"
+         "var n1=window.dispatchEvent(ev);var ev2=new KeyboardEvent('%@',{code:'%@',key:'%@',bubbles:true,cancelable:true});"
+         "var n2=document.dispatchEvent(ev2);"
+         "return 'code='+ev.code+' winPrevented='+ev.defaultPrevented+' docPrevented='+ev2.defaultPrevented;})();",
+        down ? @"keydown" : @"keyup", code, code, down ? @"keydown" : @"keyup", code, code];
+    [gWebView evaluateJavaScript:js completionHandler:^(id r, NSError *err) {   // DEBUG
+        if (err) fprintf(stderr, "WASM5 FORWARD %s js error: %s\n", code.UTF8String, err.localizedDescription.UTF8String);
+        else     fprintf(stderr, "WASM5 FORWARD %s -> %s\n", down ? "down" : "up", r ? [[r description] UTF8String] : "nil");
+    }];
+}
+
+void wasm5_install_keymonitor(void) {
+    if (gKeyMonitor) return;
+    gKeyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:(NSEventMaskKeyDown | NSEventMaskKeyUp)
+                                                        handler:^NSEvent *(NSEvent *e) {
+        BOOL down = (e.type == NSEventTypeKeyDown);
+        fprintf(stderr, "WASM5 MONITOR fire keyCode=%d down=%d webviewUp=%d\n", e.keyCode, down, gWebView != nil);   // DEBUG
+        BOOL cmd  = (e.modifierFlags & NSEventModifierFlagCommand) != 0;
+        BOOL ctrl = (e.modifierFlags & NSEventModifierFlagControl) != 0;
+        if (down && cmd && e.keyCode == 12 /* Q */) { gQuitRequested = 1; return nil; }
+        if (gWebView) {
+            if (down && ctrl && e.keyCode == 53 /* esc */) { gEjectRequested = 1; return nil; }
+            forwardKeyToWebview(e, down);   // inject into the cart's JS (focus-independent)
+            return nil;                     // we handled it
+        }
+        if (down) { int sf = macToSf(e.keyCode); if (sf >= 0) { wasm5_push_key(sf); return nil; } }  // shell nav
+        return e;
+    }];
+}
 
 // Resolve a cart path (a directory, or a .zip) to a folder containing index.html.
 static NSString *resolveWebDir(NSString *path) {
@@ -63,6 +145,11 @@ void wasm5_play_cart(void *nswindow, const char *cartPath) {
     wv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:wv];
     gWebView = wv;
+    gWindow  = win;
+    // Hand keyboard focus to the webview so keystrokes reach the cart (Canvas2D game),
+    // not SDL's content view — otherwise the SDL host eats them (e.g. F = fullscreen).
+    [win makeFirstResponder:wv];
+    gEjectRequested = 0;   // the app-wide key monitor (CTRL+ESC) handles eject
 
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/index.html", kPort]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -73,6 +160,8 @@ void wasm5_play_cart(void *nswindow, const char *cartPath) {
 void wasm5_eject(void) {
     if (gWebView) { [gWebView removeFromSuperview]; gWebView = nil; }
     if (gServer)  { [gServer terminate]; gServer = nil; }
+    // give keyboard focus back to SDL's view so the shell responds to keys again
+    if (gWindow) { [gWindow makeFirstResponder:gWindow.contentView]; gWindow = nil; }
 }
 
 // Make the app a regular foreground app and the SDL window key, so it receives
@@ -87,8 +176,17 @@ void wasm5_activate(void *nswindow) {
     }
 }
 
-// Service the main run loop so WebKit's networking/JS/rendering run while a cart is up.
+// Pump the NSApplication event queue (NOT just the run loop) while a cart is up: this
+// keeps the app responsive (no beachball) AND dispatches NSEvents — including keystrokes
+// — to the key window's first responder, i.e. the webview. (NSRunLoop runMode alone
+// services run-loop sources but never drains the OS event queue, so the app appears
+// hung.) The webview is first responder and SDL isn't pumping, so keys reach the cart.
 void wasm5_pump_runloop(double seconds) {
-    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    NSEvent *e;
+    while ((e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until
+                                      inMode:NSDefaultRunLoopMode dequeue:YES]) != nil) {
+        [NSApp sendEvent:e];
+        if ([until timeIntervalSinceNow] <= 0) break;
+    }
 }

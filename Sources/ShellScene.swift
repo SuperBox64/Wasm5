@@ -149,6 +149,7 @@ final class ShellScene: SKScene {
     }
 
     override func keyDown(with event: NSEvent) {
+        print("WASM5 keyDown reached scene: keyCode=\(event.keyCode)")   // DEBUG
         switch Int(event.keyCode) {
         case 126:
             if !carts.isEmpty {

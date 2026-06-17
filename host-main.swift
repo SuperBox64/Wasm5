@@ -17,6 +17,20 @@ func wasm5_eject()
 func wasm5_activate(_ nswindow: UnsafeMutableRawPointer?)
 @_silgen_name("wasm5_pump_runloop")
 func wasm5_pump_runloop(_ seconds: Double)
+@_silgen_name("wasm5_eject_requested")
+func wasm5_eject_requested() -> Int32
+@_silgen_name("wasm5_quit_requested")
+func wasm5_quit_requested() -> Int32
+@_silgen_name("wasm5_install_keymonitor")
+func wasm5_install_keymonitor()
+
+// Called by the shim's key monitor: feed an SFML key code straight into the kit event
+// queue (SDL's keyboard is unreliable with WebKit linked, so we bypass it for the shell).
+@_cdecl("wasm5_push_key")
+func wasm5_push_key(_ sfcode: Int32) {
+    Kit.shared.pushEvent((5, sfcode, 0, 0, 0))
+    Kit.shared.pushEvent((6, sfcode, 0, 0, 0))   // immediate key-up; the shell only acts on key-down
+}
 
 // MARK: - cart slot state (main thread inserts/ejects; game thread owns the shell tick)
 nonisolated(unsafe) var slotMutex: OpaquePointer? = nil
@@ -101,10 +115,12 @@ enum Main {
         // Foreground + key the SDL window so the shell actually receives keystrokes
         // (the WebKit/Cocoa link can otherwise leave the app un-activated).
         if let raw = nativeWindowPtr() { wasm5_activate(raw) }
+        wasm5_install_keymonitor()   // route keyboard via a macOS monitor (SDL's keys are broken with WebKit linked)
 
         // game thread: tick + present the shell whenever no webview cart is up
         let gameThread = SDL_CreateThreadRuntime({ _ in
             var last = SDL_GetTicksNS()
+            var gtick = 0
             while SDL_GetAtomicInt(&runFlag) == 1 {
                 let now = SDL_GetTicksNS()
                 var dt = Float(now - last) / 1_000_000; last = now
@@ -113,6 +129,8 @@ enum Main {
                     shellTick(Double(dt))
                     kitHostPresent()
                 }
+                gtick += 1
+                if gtick % 60 == 0 { print("WASM5 GAME-THREAD looping frame=\(gtick) cartLoaded=\(SDL_GetAtomicInt(&cartLoaded))") }  // DEBUG
                 SDL_DelayNS(16_666_666)
             }
             return 0
@@ -120,28 +138,53 @@ enum Main {
 
         // main thread: OS event pump + console controls + webview management
         var shownFPS: Int32 = -1
+        var dbgTick = 0
+        var dbgKeys = [Bool](repeating: false, count: 512)   // DEBUG: detect SDL key-down transitions
         while SDL_GetAtomicInt(&runFlag) == 1 {
             let fps = SDL_GetAtomicInt(&currentFPS)
             if fps != shownFPS {
                 shownFPS = fps
                 _ = "Wasm5".withCString { SDL_SetWindowTitle(Kit.shared.window, $0) }
             }
-            if !kitHostPump() { SDL_SetAtomicInt(&runFlag, 0); break }
-            if let p = takePendingCart() { showWebCart(p) }
-            if kitEscapePressed {
-                kitEscapePressed = false
-                if SDL_GetAtomicInt(&cartLoaded) == 1 { hideWebCart() }
+            if wasm5_quit_requested() != 0 { SDL_SetAtomicInt(&runFlag, 0); break }   // CMD+Q
+
+            if SDL_GetAtomicInt(&cartLoaded) == 1 {
+                // A cart's webview owns the window. Do NOT pump SDL here — SDL's event
+                // pump dequeues the key NSEvents and re-focuses its own content view,
+                // stealing the keyboard from the webview. Instead let the Cocoa run loop
+                // dispatch events straight to the webview (first responder). CTRL+ESC is
+                // caught by the shim's local monitor.
+                if wasm5_eject_requested() != 0 { hideWebCart() }
+                else { wasm5_pump_runloop(0.012) }
+                continue
             }
-            if SDL_GetAtomicInt(&ejectFlag) == 1 { SDL_SetAtomicInt(&ejectFlag, 0); hideWebCart() }
+
+            // shell: SDL owns the window — pump events + handle console controls
+            if !kitHostPump() { SDL_SetAtomicInt(&runFlag, 0); break }
+            // DEBUG: print SDL key-down transitions (does SDL receive the arrows at all?)
+            var nk: Int32 = 0
+            if let st = SDL_GetKeyboardState(&nk) {
+                let n = min(Int(nk), 512)
+                for i in 0..<n {
+                    if st[i] && !dbgKeys[i] { print("WASM5 SDL-KEYDOWN scancode=\(i)") }
+                    dbgKeys[i] = st[i]
+                }
+            }
+            dbgTick += 1   // DEBUG: ~once/sec, report whether the shell window has keyboard focus
+            if dbgTick >= 250 {
+                dbgTick = 0
+                let focused = (SDL_GetWindowFlags(Kit.shared.window) & 0x200) != 0   // SDL_WINDOW_INPUT_FOCUS
+                var nk: Int32 = 0
+                var anyKey = false
+                if let st = SDL_GetKeyboardState(&nk) { for i in 0..<Int(nk) where st[i] { anyKey = true; break } }
+                print("WASM5 DBG  inputFocus=\(focused)  anyKeyDownNow=\(anyKey)")
+            }
+            if let p = takePendingCart() { showWebCart(p) }
+            kitEscapePressed = false
+            if SDL_GetAtomicInt(&ejectFlag) == 1 { SDL_SetAtomicInt(&ejectFlag, 0) }
             if SDL_GetAtomicInt(&wantDialog) == 1 { SDL_SetAtomicInt(&wantDialog, 0); openCartDialog() }
             if let dropped = kitDroppedFile { kitDroppedFile = nil; insertCart(dropped) }
-            // While a webview cart is up, service the main run loop so WebKit runs;
-            // otherwise idle (the shell renders on the game thread).
-            if SDL_GetAtomicInt(&cartLoaded) == 1 {
-                wasm5_pump_runloop(0.008)
-            } else {
-                SDL_DelayNS(4_000_000)
-            }
+            SDL_DelayNS(4_000_000)
         }
 
         hideWebCart()
