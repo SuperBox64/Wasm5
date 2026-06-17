@@ -23,6 +23,10 @@ func wasm5_eject_requested() -> Int32
 func wasm5_quit_requested() -> Int32
 @_silgen_name("wasm5_install_keymonitor")
 func wasm5_install_keymonitor()
+@_silgen_name("wasm5_start_server")
+func wasm5_start_server() -> Int32
+@_silgen_name("wasm5_shutdown_server")
+func wasm5_shutdown_server()
 
 // Called by the shim's key monitor: feed an SFML key code straight into the kit event
 // queue (SDL's keyboard is unreliable with WebKit linked, so we bypass it for the shell).
@@ -116,6 +120,7 @@ enum Main {
         // (the WebKit/Cocoa link can otherwise leave the app un-activated).
         if let raw = nativeWindowPtr() { wasm5_activate(raw) }
         wasm5_install_keymonitor()   // route keyboard via a macOS monitor (SDL's keys are broken with WebKit linked)
+        _ = wasm5_start_server()     // one persistent http.server; cart loads just repoint its serving symlink
 
         // game thread: tick + present the shell whenever no webview cart is up
         let gameThread = SDL_CreateThreadRuntime({ _ in
@@ -188,6 +193,7 @@ enum Main {
         }
 
         hideWebCart()
+        wasm5_shutdown_server()   // stop the persistent http.server on exit (don't orphan it)
         SDL_WaitThread(gameThread, nil)
         SDL_Quit()
     }

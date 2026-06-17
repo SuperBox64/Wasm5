@@ -10,12 +10,14 @@
 #import <arpa/inet.h>
 
 static WKWebView *gWebView = nil;
-static NSTask    *gServer  = nil;
+static NSTask    *gServer  = nil;   // ONE persistent http.server for the whole app lifetime
 static NSWindow  *gWindow  = nil;
 static id         gKeyMonitor = nil;
 static volatile int gEjectRequested = 0;
 static volatile int gQuitRequested  = 0;
 static const int  kPort    = 52900;
+static NSString  *gServeLink = nil;   // stable symlink the server serves; repoint to swap carts
+static NSString  *gEmptyDir = nil;   // empty placeholder dir (what the link points at when no cart is loaded)
 
 extern void wasm5_push_key(int sfcode);   // host: push an SFML key code into the kit event queue
 
@@ -126,14 +128,13 @@ static NSString *resolveWebDir(NSString *path) {
     return nil;
 }
 
-// --- port reclaim: don't let a stale server serve the wrong cart -------------
-// The cart's web build is served by a python http.server on a fixed port (kPort). If a
-// previous Wasm5 run quit/crashed while a cart was up, that server keeps holding kPort —
-// NSTask children are reparented to launchd and outlive a crashed parent. The next cart's
-// server then can't bind; the bind error is swallowed (stdout/stderr -> null) and the
-// webview silently loads whatever the stale server is still serving: the WRONG cart.
-// So before starting our own server we reclaim the port, and we only show the webview
-// once OUR process is the one listening on it.
+// --- one persistent http.server; swap carts by repointing a symlink ------------
+// A single python http.server runs on kPort for the whole app lifetime. Its --directory
+// is a STABLE SYMLINK (gServeLink). To play a cart we repoint that symlink at the cart's
+// extracted dir (ln -sfn); the running server re-resolves the symlink per request and
+// serves the new cart instantly — no per-cart spawn/kill, so no port collisions, no
+// orphaned servers piling up across carts, and no wrong-cart 404s from a stale listener.
+// (If a prior run crashed mid-cart, its lone orphan is reclaimed once, at server start.)
 
 // Is anything listening on 127.0.0.1:port? (cheap TCP connect; no subprocess.)
 static BOOL portListening(int port) {
@@ -185,43 +186,68 @@ static void reclaimPort(int port) {
     }
 }
 
+// Repoint the serving symlink at `dir` (atomic-ish: ln -sfn replaces the link in place).
+// The running http.server re-resolves it on the next request, so the cart swaps instantly.
+static void pointServerAt(NSString *dir) {
+    if (!gServeLink || !dir) return;
+    NSTask *t = [[NSTask alloc] init];
+    t.executableURL = [NSURL fileURLWithPath:@"/bin/ln"];
+    t.arguments = @[@"-sfn", dir, gServeLink];   // -s symlink, -f force, -n replace (don't descend into)
+    t.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+    t.standardError  = [NSFileHandle fileHandleWithNullDevice];
+    [t launchAndReturnError:nil];
+    [t waitUntilExit];
+}
+
+// Start the persistent server once (and restart it if it ever dies). Serves the empty
+// placeholder until a cart is loaded. Returns YES once OUR process is listening on kPort.
+static BOOL ensureServer(void) {
+    if (gServer && portListening(kPort) && portListenerPid(kPort) == [gServer processIdentifier]) return YES;
+    if (gServer) { [gServer terminate]; gServer = nil; }   // it died — clean up before restarting
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (!gServeLink) gServeLink = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wasm5-serving"];
+    if (!gEmptyDir)  gEmptyDir  = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wasm5-empty"];
+    [fm createDirectoryAtPath:gEmptyDir withIntermediateDirectories:YES attributes:nil error:nil];
+    pointServerAt(gEmptyDir);   // serve nothing until a cart loads
+
+    reclaimPort(kPort);   // one-time: kill any orphan left by a prior crashed run
+
+    NSTask *srv = [[NSTask alloc] init];
+    srv.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    srv.arguments = @[@"python3", @"-m", @"http.server", [@(kPort) stringValue],
+                      @"--bind", @"127.0.0.1", @"--directory", gServeLink];
+    srv.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+    srv.standardError  = [NSFileHandle fileHandleWithNullDevice];
+    if (![srv launchAndReturnError:nil]) { fprintf(stderr, "Wasm5: http server failed (need python3)\n"); return NO; }
+    gServer = srv;
+
+    // Wait until OUR server owns kPort. env execs python3 in place, so srv's PID is the
+    // listener's. If it never binds, bail (no cart loaded) instead of serving a stale one.
+    pid_t ourPid = [srv processIdentifier];
+    for (int i = 0; i < 20; i++) {           // up to ~0.5s
+        if (portListening(kPort)) {
+            if (portListenerPid(kPort) == ourPid) return YES;
+            break;   // someone else holds our port — give up rather than serve the wrong cart
+        }
+        [NSThread sleepForTimeInterval:0.025];
+    }
+    fprintf(stderr, "Wasm5: http server failed to bind port %d\n", kPort);
+    if (gServer) { [gServer terminate]; gServer = nil; }
+    return NO;
+}
+
 // Show a cart's web build in a WKWebView over the SDL window. MAIN THREAD ONLY.
 void wasm5_play_cart(void *nswindow, const char *cartPath) {
     if (gWebView || nswindow == NULL || cartPath == NULL) return;
     NSString *dir = resolveWebDir([NSString stringWithUTF8String:cartPath]);
     if (!dir) { fprintf(stderr, "Wasm5: no index.html for %s\n", cartPath); return; }
 
-    // Reclaim kPort from any orphaned server left by a prior crashed run, start ours,
-    // then wait until OUR process is the one listening — otherwise the webview would
-    // load the stale server's (wrong) cart. (See the port-reclaim note above.)
-    reclaimPort(kPort);
-
-    NSTask *srv = [[NSTask alloc] init];
-    srv.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
-    srv.arguments = @[@"python3", @"-m", @"http.server", [@(kPort) stringValue],
-                      @"--bind", @"127.0.0.1", @"--directory", dir];
-    srv.standardOutput = [NSFileHandle fileHandleWithNullDevice];
-    srv.standardError  = [NSFileHandle fileHandleWithNullDevice];
-    if (![srv launchAndReturnError:nil]) { fprintf(stderr, "Wasm5: http server failed (need python3)\n"); return; }
-    gServer = srv;
-
-    // Confirm our server actually bound kPort. If it never does (the port didn't free,
-    // or python3 is missing), bail BEFORE showing the webview instead of loading the
-    // stale server's cart. env execs python3 in place, so srv's PID IS the listener's.
-    pid_t ourPid = [srv processIdentifier];
-    BOOL bound = NO;
-    for (int i = 0; i < 20; i++) {           // up to ~0.5s
-        if (portListening(kPort)) {
-            if (portListenerPid(kPort) == ourPid) { bound = YES; break; }
-            break;   // someone else holds our port (reclaim failed) — don't load the wrong cart
-        }
-        [NSThread sleepForTimeInterval:0.025];
-    }
-    if (!bound) {
-        fprintf(stderr, "Wasm5: http server failed to bind port %d (cart %s not loaded)\n", kPort, cartPath);
-        if (gServer) { [gServer terminate]; gServer = nil; }
-        return;
-    }
+    // The server is already running (started at launch). Point it at this cart's dir; the
+    // running http.server re-resolves the symlink and serves the new cart instantly. No
+    // per-cart spawn/kill -> no port collisions, no orphans, no wrong-cart 404s.
+    if (!ensureServer()) return;   // safety net: restart it if it ever died, else bail
+    pointServerAt(dir);
 
     NSWindow *win = (__bridge NSWindow *)nswindow;
     NSView *content = win.contentView;
@@ -237,17 +263,26 @@ void wasm5_play_cart(void *nswindow, const char *cartPath) {
     gEjectRequested = 0;   // the app-wide key monitor (CTRL+ESC) handles eject
 
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/index.html", kPort]];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (gWebView == wv) [wv loadRequest:[NSURLRequest requestWithURL:url]];
     });
 }
 
 void wasm5_eject(void) {
     if (gWebView) { [gWebView removeFromSuperview]; gWebView = nil; }
-    if (gServer)  { [gServer terminate]; gServer = nil; }
+    // The server is persistent (kept across carts); just stop serving this cart's data.
+    pointServerAt(gEmptyDir);
     // give keyboard focus back to SDL's view so the shell responds to keys again
     if (gWindow) { [gWindow makeFirstResponder:gWindow.contentView]; gWindow = nil; }
 }
+
+// Start the one persistent http.server (called once at app launch). It runs for the
+// whole app lifetime; cart loads just repoint the serving symlink. Returns 1 on success.
+int wasm5_start_server(void) { return ensureServer() ? 1 : 0; }
+
+// Tear down the server on app exit so we don't orphan it. (A crash orphan is reclaimed
+// at the next launch by ensureServer's one-time reclaimPort.)
+void wasm5_shutdown_server(void) { if (gServer) { [gServer terminate]; gServer = nil; } }
 
 // Make the app a regular foreground app and the SDL window key, so it receives
 // keyboard events. Linking WebKit/Cocoa can leave the NSApplication un-activated
