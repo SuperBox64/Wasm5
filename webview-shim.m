@@ -60,18 +60,28 @@ static NSString *macToDomCode(NSEvent *e) {
     return nil;
 }
 
-// Inject the keystroke straight into the webview's JS as a synthetic KeyboardEvent —
-// no first-responder/focus needed (runtime.js listens on window keydown/keyup, e.code).
+// Inject the keystroke into the webview's JS as a synthetic KeyboardEvent, dispatched on
+// the FOCUSED element so it bubbles up like a real keypress: target -> documentElement ->
+// document -> window. That reaches a cart's listener no matter which level it's on
+// (ufoemoji listens on window; webrcade/Stella listens on document.documentElement — and DOM
+// events only bubble UP, so a window/document dispatch never reached documentElement, which
+// is why atari2600 got no keys). keyCode is set too (some webrcade paths read it).
 static void forwardKeyToWebview(NSEvent *e, BOOL down) {
     if (!gWebView) return;
     NSString *code = macToDomCode(e);
     if (!code) { fprintf(stderr, "WASM5 FORWARD: no DOM code for keyCode=%d\n", e.keyCode); return; }
     NSString *js = [NSString stringWithFormat:
-        @"(function(){var ev=new KeyboardEvent('%@',{code:'%@',key:'%@',bubbles:true,cancelable:true});"
-         "var n1=window.dispatchEvent(ev);var ev2=new KeyboardEvent('%@',{code:'%@',key:'%@',bubbles:true,cancelable:true});"
-         "var n2=document.dispatchEvent(ev2);"
-         "return 'code='+ev.code+' winPrevented='+ev.defaultPrevented+' docPrevented='+ev2.defaultPrevented;})();",
-        down ? @"keydown" : @"keyup", code, code, down ? @"keydown" : @"keyup", code, code];
+        @"(function(){"
+         "var type='%@',code='%@';"
+         "var kc={ArrowUp:38,ArrowDown:40,ArrowLeft:37,ArrowRight:39,Space:32,Enter:13,NumpadEnter:13,Escape:27,Tab:9,Backspace:8,"
+         "ShiftLeft:16,ShiftRight:16,ControlLeft:17,ControlRight:17,AltLeft:18,AltRight:18,MetaLeft:91,MetaRight:91};"
+         "if(!(code in kc)){if(/^Key[A-Z]$/.test(code))kc[code]=code.charCodeAt(3);else if(/^Digit[0-9]$/.test(code))kc[code]=code.charCodeAt(5);}"
+         "var ev=new KeyboardEvent(type,{code:code,key:code,bubbles:true,cancelable:true});"
+         "var k=kc[code]||0;if(k){Object.defineProperty(ev,'keyCode',{value:k});Object.defineProperty(ev,'which',{value:k});}"
+         "var t=document.activeElement||document.body;t.dispatchEvent(ev);"   // bubbles up through documentElement -> document -> window
+         "return 'tgt='+(t&&t.tagName)+' code='+ev.code+' kc='+ev.keyCode+' prev='+ev.defaultPrevented;"
+         "})();",
+        down ? @"keydown" : @"keyup", code];
     [gWebView evaluateJavaScript:js completionHandler:^(id r, NSError *err) {   // DEBUG
         if (err) fprintf(stderr, "WASM5 FORWARD %s js error: %s\n", code.UTF8String, err.localizedDescription.UTF8String);
         else     fprintf(stderr, "WASM5 FORWARD %s -> %s\n", down ? "down" : "up", r ? [[r description] UTF8String] : "nil");
