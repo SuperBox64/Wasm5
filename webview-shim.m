@@ -261,8 +261,35 @@ void wasm5_play_cart(void *nswindow, const char *cartPath) {
 
     NSWindow *win = (__bridge NSWindow *)nswindow;
     NSView *content = win.contentView;
-    WKWebView *wv = [[WKWebView alloc] initWithFrame:content.bounds
-                                       configuration:[[WKWebViewConfiguration alloc] init]];
+
+    // Inject a keyboard navigator into the cart's ROM picker (the atari2600 cart's
+    // play.html lists its ROMs as mouse-only .rom cards — no key handler — so arrow/
+    // enter did nothing there and you couldn't pick a game with the keyboard). This
+    // user script runs at document-end on every page: on the picker (#grid) it turns
+    // the cards into a keyboard menu (arrows move, Enter/Space launches the highlighted
+    // ROM); on an in-game page there's no #grid, so it no-ops and the real game keys
+    // flow straight to Stella via the documentElement keydown listener our
+    // forwardKeyToWebview synthetic events bubble up to. This is the "listen on window"
+    // the host needs because the cart's own picker has no listener.
+    NSString *pickerNavJS = @"(function(){"
+        "var grid=document.getElementById('grid');if(!grid)return;"            // not the picker page
+        "var sel=0;function C(){return grid.querySelectorAll('.rom');}"
+        "function paint(){var c=C();for(var i=0;i<c.length;i++){c[i].style.outline=i===sel?'3px solid #e0392b':'none';c[i].style.background=i===sel?'#262626':'';}if(c[sel])c[sel].scrollIntoView({block:'nearest'});}"
+        "new MutationObserver(paint).observe(grid,{childList:true});"          // cards load async via fetch('rom/')
+        "setTimeout(paint,150);setTimeout(paint,1200);"
+        "window.addEventListener('keydown',function(e){var c=C();if(!c.length)return;var k=e.code;"
+        "if(k==='ArrowRight'||k==='ArrowDown'){sel=(sel+1+c.length)%c.length;paint();e.preventDefault();}"
+        "else if(k==='ArrowLeft'||k==='ArrowUp'){sel=(sel-1+c.length)%c.length;paint();e.preventDefault();}"
+        "else if(k==='Enter'||k==='Space'){if(c[sel])c[sel].dispatchEvent(new MouseEvent('click',{bubbles:true}));e.preventDefault();}});"
+        "grid.addEventListener('mouseover',function(e){var c=C();for(var i=0;i<c.length;i++){if(c[i]===e.target||c[i].contains(e.target)){sel=i;paint();break;}}});"
+        "})();";
+    WKUserContentController *uc = [[WKUserContentController alloc] init];
+    [uc addUserScript:[[WKUserScript alloc] initWithSource:pickerNavJS
+                                         injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+                                         forMainFrameOnly:YES]];
+    WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+    cfg.userContentController = uc;
+    WKWebView *wv = [[WKWebView alloc] initWithFrame:content.bounds configuration:cfg];
     wv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:wv];
     gWebView = wv;
@@ -272,7 +299,11 @@ void wasm5_play_cart(void *nswindow, const char *cartPath) {
     [win makeFirstResponder:wv];
     gEjectRequested = 0;   // the app-wide key monitor (CTRL+ESC) handles eject
 
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/index.html", kPort]];
+    // Cache-bust with a per-load timestamp: every cart serves the same URL (/index.html),
+    // so without this WKWebView reuses the previous cart's cached index.html when switching
+    // carts (e.g. Atari -> UFO Emoji would show Atari again). A unique query forces a fetch.
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/index.html?t=%lld",
+                                        kPort, (long long)([NSDate timeIntervalSinceReferenceDate] * 1000.0)]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (gWebView == wv) [wv loadRequest:[NSURLRequest requestWithURL:url]];
     });
