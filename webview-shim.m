@@ -5,6 +5,9 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #import <stdio.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
 
 static WKWebView *gWebView = nil;
 static NSTask    *gServer  = nil;
@@ -123,11 +126,75 @@ static NSString *resolveWebDir(NSString *path) {
     return nil;
 }
 
+// --- port reclaim: don't let a stale server serve the wrong cart -------------
+// The cart's web build is served by a python http.server on a fixed port (kPort). If a
+// previous Wasm5 run quit/crashed while a cart was up, that server keeps holding kPort —
+// NSTask children are reparented to launchd and outlive a crashed parent. The next cart's
+// server then can't bind; the bind error is swallowed (stdout/stderr -> null) and the
+// webview silently loads whatever the stale server is still serving: the WRONG cart.
+// So before starting our own server we reclaim the port, and we only show the webview
+// once OUR process is the one listening on it.
+
+// Is anything listening on 127.0.0.1:port? (cheap TCP connect; no subprocess.)
+static BOOL portListening(int port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return NO;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    BOOL up = (connect(s, (struct sockaddr *)&a, sizeof a) == 0);
+    close(s);
+    return up;
+}
+
+// PID of the process listening on 127.0.0.1:port (0 if none). Used to confirm the
+// listener is OUR server, not a stale one that survived reclaim.
+static pid_t portListenerPid(int port) {
+    NSTask *t = [[NSTask alloc] init];
+    t.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+    t.arguments = @[@"-c", [NSString stringWithFormat:
+        @"/usr/sbin/lsof -ti tcp:%d -sTCP:LISTEN 2>/dev/null", port]];
+    NSPipe *out = [NSPipe pipe];
+    t.standardOutput = out;
+    t.standardError = [NSFileHandle fileHandleWithNullDevice];
+    [t launchAndReturnError:nil];
+    [t waitUntilExit];
+    NSString *s = [[NSString alloc] initWithData:[[out fileHandleForReading] readDataToEndOfFile]
+                                          encoding:NSUTF8StringEncoding];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length ? (pid_t)[s integerValue] : 0;
+}
+
+// Kill any stale listener on our port (SIGTERM, then SIGKILL if it won't go).
+static void reclaimPort(int port) {
+    for (int pass = 0; pass < 2; pass++) {
+        if (!portListening(port)) return;
+        NSTask *t = [[NSTask alloc] init];
+        t.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+        t.arguments = @[@"-c", [NSString stringWithFormat:
+            pass == 0 ? @"/usr/sbin/lsof -ti tcp:%d -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null"
+                      : @"/usr/sbin/lsof -ti tcp:%d -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null",
+            port]];
+        t.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        t.standardError  = [NSFileHandle fileHandleWithNullDevice];
+        [t launchAndReturnError:nil];
+        [t waitUntilExit];
+        [NSThread sleepForTimeInterval:0.05];   // let the killed socket release
+    }
+}
+
 // Show a cart's web build in a WKWebView over the SDL window. MAIN THREAD ONLY.
 void wasm5_play_cart(void *nswindow, const char *cartPath) {
     if (gWebView || nswindow == NULL || cartPath == NULL) return;
     NSString *dir = resolveWebDir([NSString stringWithUTF8String:cartPath]);
     if (!dir) { fprintf(stderr, "Wasm5: no index.html for %s\n", cartPath); return; }
+
+    // Reclaim kPort from any orphaned server left by a prior crashed run, start ours,
+    // then wait until OUR process is the one listening — otherwise the webview would
+    // load the stale server's (wrong) cart. (See the port-reclaim note above.)
+    reclaimPort(kPort);
 
     NSTask *srv = [[NSTask alloc] init];
     srv.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
@@ -137,6 +204,24 @@ void wasm5_play_cart(void *nswindow, const char *cartPath) {
     srv.standardError  = [NSFileHandle fileHandleWithNullDevice];
     if (![srv launchAndReturnError:nil]) { fprintf(stderr, "Wasm5: http server failed (need python3)\n"); return; }
     gServer = srv;
+
+    // Confirm our server actually bound kPort. If it never does (the port didn't free,
+    // or python3 is missing), bail BEFORE showing the webview instead of loading the
+    // stale server's cart. env execs python3 in place, so srv's PID IS the listener's.
+    pid_t ourPid = [srv processIdentifier];
+    BOOL bound = NO;
+    for (int i = 0; i < 20; i++) {           // up to ~0.5s
+        if (portListening(kPort)) {
+            if (portListenerPid(kPort) == ourPid) { bound = YES; break; }
+            break;   // someone else holds our port (reclaim failed) — don't load the wrong cart
+        }
+        [NSThread sleepForTimeInterval:0.025];
+    }
+    if (!bound) {
+        fprintf(stderr, "Wasm5: http server failed to bind port %d (cart %s not loaded)\n", kPort, cartPath);
+        if (gServer) { [gServer terminate]; gServer = nil; }
+        return;
+    }
 
     NSWindow *win = (__bridge NSWindow *)nswindow;
     NSView *content = win.contentView;
