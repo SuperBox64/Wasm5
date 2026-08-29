@@ -293,13 +293,13 @@ Part of the SuperBox64 / UFO Emoji constellation — one game source, seven buil
 - **[SuperBox64Kit](../SuperBox64Kit)** — *the kit.* A Swift reimplementation of Apple's SpriteKit that compiles one game-source tree three ways (browser wasm, wasm cartridge, native binary), bundling Box2D v3, an SDL3 backend, and a reSVG/nanosvg vector rasterizer. **Owns** SpriteKit emulation, the KitABI, Box2D-backed physics, the SDL3 backend, reSVG, and the drop-in story. Wasm5's shell *is* a kit `SKScene`, and `build.sh` calls the kit's `native/build-native-game.sh`.
 - **[WasmKit](../WasmKit)** — *the web runtime.* The hand-rolled, no-Emscripten JavaScript host (`runtime.js`) that renders WASI/Embedded-Swift wasm games on Canvas2D and fulfils the KitABI env imports in the browser. **This is the exact runtime Wasm5's WKWebView carts run** — Wasm5 hosts it locally instead of on a web page.
 - **[WasmCart](../WasmCart)** — *the native console.* Wasm5's sister/twin: same SDL3 shell, but it plays `.wasm`/`.aot` carts through **WAMR** (interpreter + wamrc AOT) — no browser, no JavaScript. Wasm5 **hard-depends** on its vendored `vendor/libSDL3.a`.
-- **[UFO-Emoji-Arcade](../UFO-Emoji-Arcade)** — *the flagship game / demo.* Todd Bruss' App Store arcade game UFO Emoji: one 100% Swift SpriteKit codebase shipped to iOS natively, to the browser via WebAssembly, and to native consoles — all from the same unchanged sources. Its web build is Wasm5's bundled sample cart.
+- **[UFO-Emoji-Arcade](../UFO-Emoji-Arcade)** — *the flagship game / demo.* Heisenburg' App Store arcade game UFO Emoji: one 100% Swift SpriteKit codebase shipped to iOS natively, to the browser via WebAssembly, and to native consoles — all from the same unchanged sources. Its web build is Wasm5's bundled sample cart.
 
 ---
 
 ## Credits
 
-- **Author:** Todd Bruss
+- **Author:** Heisenburg
 - **Console & game:** part of the SuperBox64 / UFO Emoji project
 - Built on [SuperBox64Kit](../SuperBox64Kit) (SpriteKit-for-wasm reimplementation, SDL3 backend, Box2D v3, reSVG), the [WasmKit](../WasmKit) `runtime.js` Canvas2D host, and [WasmCart](../WasmCart)'s vendored static SDL3
 - Repo: `https://github.com/SuperBox64/Wasm5`
