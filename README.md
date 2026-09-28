@@ -307,3 +307,9 @@ Part of the SuperBox64 / UFO Emoji constellation — one game source, seven buil
 ## License
 
 No `LICENSE` file is currently present in this repository (or in the sibling consoles). All rights reserved by the author pending an explicit license. Add a `LICENSE` file to set terms.
+
+---
+
+**AgentiLoop:** [agentiloop.ai](https://agentiloop.ai/)
+
+Copyright © 2026 AgentiLoop.ai, a Logos InkPen LLC company. All rights reserved.
